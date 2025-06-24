@@ -3,7 +3,7 @@
 This project analyzes and predicts flight delays using historical flight and weather data. It covers everything from data ingestion to feature engineering and prepares the data for machine learning model training and interpretation.
 
 ---
-
+```
 ## 📁 Project Structure
 
 flight-delay-analytics/
@@ -15,7 +15,7 @@ flight-delay-analytics/
 ├── test.ipynb # Temporary notebook for testing
 ├── README.md # Project documentation
 └── requirements.txt # Required Python packages
-
+```
 
 ---
 
