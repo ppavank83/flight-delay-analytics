@@ -38,10 +38,10 @@ try:
 
     # Define expected insert column names
     expected_cols = [
-        "flight_date", "carrier_code", "origin", "destination", "dep_hour",
+        "flight_id", "flight_date", "carrier_code", "origin", "destination", "dep_hour",
         "day_of_week", "temp_c", "wind_speed_kph", "visibility_km", "weather_code",
         "dep_delay", "arr_delay", "delay_flag",
-        "diversion_rate_origin", "diversion_rate_carrier", "flight_key"
+        "diversion_rate_origin", "diversion_rate_carrier"
     ]
 
     # Map actual column names in df (case-insensitive)

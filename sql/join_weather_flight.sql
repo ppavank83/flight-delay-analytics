@@ -1,14 +1,20 @@
--- Compute diversion rate (ratio of diverted flights) per origin airport
-WITH origin_diversion AS (
+-- Step 1: Assign a unique ID to each ATL-origin flight
+WITH numbered_flights AS (
+    SELECT 
+        ROW_NUMBER() OVER (ORDER BY flight_date, scheduled_dep_time) AS flight_id,
+        *
+    FROM flights_raw
+    WHERE origin = 'ATL'
+),
+
+-- Step 2: Compute diversion rates
+origin_diversion AS (
     SELECT 
         origin,
         CAST(SUM(CAST(diverted AS INT)) * 1.0 / COUNT(*) AS FLOAT) AS diversion_rate_origin
-        -- Convert BIT to INT, then compute average = diversion rate
     FROM flights_raw
     GROUP BY origin
 ),
-
--- Compute diversion rate per carrier (airline)
 carrier_diversion AS (
     SELECT 
         carrier_code,
@@ -17,85 +23,126 @@ carrier_diversion AS (
     GROUP BY carrier_code
 ),
 
--- Extract flights with exact weather match (same hour)
+-- Step 3: Deduplicated exact matches (same hour)
 exact_matches AS (
-    SELECT
-        f.flight_date,
-        f.carrier_code,
-        f.origin,
-        f.destination,
-        CAST(f.scheduled_dep_time / 100 AS INT) AS dep_hour,  -- Extract departure hour from HHMM format
-        f.day_of_week,
-        w.temp_c,
-        w.wind_speed_kph,
-        w.visibility_km,
-        w.weather_code,
-        f.dep_delay,
-        f.arr_delay,
-        CASE WHEN f.arr_delay > 15 THEN 1 ELSE 0 END AS delay_flag,  -- Binary label for delayed arrival
-        od.diversion_rate_origin,
-        cd.diversion_rate_carrier,
-        -- Generate a unique flight key using carrier, origin, flight number, and date
-        f.carrier_code + '_' + f.origin + '_' + CAST(f.flight_number AS VARCHAR) + '_' + CONVERT(VARCHAR, f.flight_date, 23) AS flight_key
-    FROM flights_raw f
-    JOIN weather_raw w
-        ON w.station = CONCAT('K', f.origin)  -- Weather station format is like 'KATL' for ATL
-        AND CAST(f.flight_date AS DATE) = CAST(w.date AS DATE)  -- Join on same day
-        AND CAST(f.scheduled_dep_time / 100 AS INT) = DATEPART(HOUR, w.date)  -- Exact hour match
-    LEFT JOIN origin_diversion od ON f.origin = od.origin
-    LEFT JOIN carrier_diversion cd ON f.carrier_code = cd.carrier_code
-    WHERE f.origin = 'ATL'  -- Filter only for ATL flights
+    SELECT *
+    FROM (
+        SELECT
+            nf.flight_id,
+            nf.flight_date,
+            nf.carrier_code,
+            nf.origin,
+            nf.destination,
+            CAST(nf.scheduled_dep_time / 100 AS INT) AS dep_hour,
+            nf.day_of_week,
+            w.temp_c,
+            w.wind_speed_kph,
+            w.visibility_km,
+            w.weather_code,
+            nf.dep_delay,
+            nf.arr_delay,
+            CASE WHEN nf.arr_delay > 15 THEN 1 ELSE 0 END AS delay_flag,
+            od.diversion_rate_origin,
+            cd.diversion_rate_carrier,
+            ROW_NUMBER() OVER (
+                PARTITION BY nf.flight_id
+                ORDER BY w.date
+            ) AS rn
+        FROM numbered_flights nf
+        JOIN weather_raw w
+            ON w.station = CONCAT('K', nf.origin)
+            AND CAST(nf.flight_date AS DATE) = CAST(w.date AS DATE)
+            AND CAST(nf.scheduled_dep_time / 100 AS INT) = DATEPART(HOUR, w.date)
+        LEFT JOIN origin_diversion od ON nf.origin = od.origin
+        LEFT JOIN carrier_diversion cd ON nf.carrier_code = cd.carrier_code
+    ) AS ranked_exact
+    WHERE rn = 1
 ),
 
--- Find closest weather match for each flight (excluding exact matches)
+-- Step 4: Deduplicated closest match (±1 hour), excluding those already matched
 ranked_matches AS (
     SELECT *,
-        -- Assign rank to each weather match for a flight based on how close the hour is to departure
         ROW_NUMBER() OVER (
-            PARTITION BY f.carrier_code, f.origin, f.flight_number, f.flight_date
-            ORDER BY ABS(CAST(f.scheduled_dep_time / 100 AS INT) - DATEPART(HOUR, w.date))  -- Lower hour diff = better
+            PARTITION BY nf.flight_id
+            ORDER BY ABS(CAST(nf.scheduled_dep_time / 100 AS INT) - DATEPART(HOUR, w.date))
         ) AS rn
-    FROM flights_raw f
+    FROM numbered_flights nf
     JOIN weather_raw w
-        ON w.station = CONCAT('K', f.origin)
-        AND CAST(f.flight_date AS DATE) = CAST(w.date AS DATE)
-        AND ABS(CAST(f.scheduled_dep_time / 100 AS INT) - DATEPART(HOUR, w.date)) <= 1  -- Match within ±1 hour
-        AND CAST(f.scheduled_dep_time / 100 AS INT) <> DATEPART(HOUR, w.date)  -- Exclude exact matches
-    WHERE f.origin = 'ATL'
+        ON w.station = CONCAT('K', nf.origin)
+        AND CAST(nf.flight_date AS DATE) = CAST(w.date AS DATE)
+        AND ABS(CAST(nf.scheduled_dep_time / 100 AS INT) - DATEPART(HOUR, w.date)) <= 1
+        AND CAST(nf.scheduled_dep_time / 100 AS INT) <> DATEPART(HOUR, w.date)
 ),
-
--- Select only the closest weather row for each unmatched flight
 closest_matches AS (
     SELECT
-        f.flight_date,
-        f.carrier_code,
-        f.origin,
-        f.destination,
-        CAST(f.scheduled_dep_time / 100 AS INT) AS dep_hour,
-        f.day_of_week,
+        nf.flight_id,
+        nf.flight_date,
+        nf.carrier_code,
+        nf.origin,
+        nf.destination,
+        CAST(nf.scheduled_dep_time / 100 AS INT) AS dep_hour,
+        nf.day_of_week,
         w.temp_c,
         w.wind_speed_kph,
         w.visibility_km,
         w.weather_code,
-        f.dep_delay,
-        f.arr_delay,
-        CASE WHEN f.arr_delay > 15 THEN 1 ELSE 0 END AS delay_flag,
+        nf.dep_delay,
+        nf.arr_delay,
+        CASE WHEN nf.arr_delay > 15 THEN 1 ELSE 0 END AS delay_flag,
         od.diversion_rate_origin,
-        cd.diversion_rate_carrier,
-        f.carrier_code + '_' + f.origin + '_' + CAST(f.flight_number AS VARCHAR) + '_' + CONVERT(VARCHAR, f.flight_date, 23) AS flight_key
-    FROM ranked_matches f
+        cd.diversion_rate_carrier
+    FROM ranked_matches rm
+    JOIN numbered_flights nf ON rm.flight_id = nf.flight_id
     JOIN weather_raw w
-        ON w.station = CONCAT('K', f.origin)
-        AND CAST(f.flight_date AS DATE) = CAST(w.date AS DATE)
-        AND ABS(CAST(f.scheduled_dep_time / 100 AS INT) - DATEPART(HOUR, w.date)) <= 1
-        AND CAST(f.scheduled_dep_time / 100 AS INT) <> DATEPART(HOUR, w.date)
-    LEFT JOIN origin_diversion od ON f.origin = od.origin
-    LEFT JOIN carrier_diversion cd ON f.carrier_code = cd.carrier_code
-    WHERE f.rn = 1  -- Keep only the top-ranked (closest) weather row
+        ON w.station = CONCAT('K', nf.origin)
+        AND CAST(nf.flight_date AS DATE) = CAST(w.date AS DATE)
+        AND ABS(CAST(nf.scheduled_dep_time / 100 AS INT) - DATEPART(HOUR, w.date)) <= 1
+        AND CAST(nf.scheduled_dep_time / 100 AS INT) <> DATEPART(HOUR, w.date)
+    LEFT JOIN origin_diversion od ON nf.origin = od.origin
+    LEFT JOIN carrier_diversion cd ON nf.carrier_code = cd.carrier_code
+    WHERE rm.rn = 1
+    AND NOT EXISTS (
+        SELECT 1 FROM exact_matches em WHERE em.flight_id = rm.flight_id
+    )
 )
 
--- Final union of exact and closest matches
--- UNION automatically removes duplicates based on all selected fields (includes flight_key)
-SELECT * FROM exact_matches
+-- Step 5: Final result (exact if available, else closest)
+SELECT
+    flight_id,
+    flight_date,
+    carrier_code,
+    origin,
+    destination,
+    dep_hour,
+    day_of_week,
+    temp_c,
+    wind_speed_kph,
+    visibility_km,
+    weather_code,
+    dep_delay,
+    arr_delay,
+    delay_flag,
+    diversion_rate_origin,
+    diversion_rate_carrier
+FROM exact_matches
+
 UNION
-SELECT * FROM closest_matches
+
+SELECT
+    flight_id,
+    flight_date,
+    carrier_code,
+    origin,
+    destination,
+    dep_hour,
+    day_of_week,
+    temp_c,
+    wind_speed_kph,
+    visibility_km,
+    weather_code,
+    dep_delay,
+    arr_delay,
+    delay_flag,
+    diversion_rate_origin,
+    diversion_rate_carrier
+FROM closest_matches;
